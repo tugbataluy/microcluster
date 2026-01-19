@@ -124,12 +124,21 @@ func trustDelete(s state.State, r *http.Request) response.Response {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	remotesMap := s.Remotes().RemotesByName()
-	nodeToRemove, ok := remotesMap[name]
-	if !ok {
-		return response.SmartError(fmt.Errorf("No truststore entry found for node with name %q", name))
+	logger, err := log.LoggerFromContext(ctx)
+	if err != nil {
+		return response.InternalError(err)
 	}
 
+	remotesMap := s.Remotes().RemotesByName()
+	nodeToRemove, ok := remotesMap[name]
+
+	// Log whether we have the entry locally for debugging.
+	if !ok {
+		logger.Warn("Truststore entry not found locally during deletion request", slog.String("name", name), slog.Bool("is_notification", types.IsNotification(r)))
+	}
+
+	// Propagate to cluster members before checking local state.
+	// This ensures deletion happens across the cluster even if the leader doesn't have the entry (e.g, due to heartbeat timing).
 	if !types.IsNotification(r) {
 		clients, err := s.Connect().Cluster(true)
 		if err != nil {
@@ -138,7 +147,7 @@ func trustDelete(s state.State, r *http.Request) response.Response {
 
 		err = clients.Query(ctx, true, func(ctx context.Context, c types.Client) error {
 			// No need to send a request to ourselves, or to the node we are adding.
-			if s.Address().URL.Host == c.URL().Host || nodeToRemove.URL().URL.Host == c.URL().Host {
+			if (s.Address().URL.Host == c.URL().Host) || (nodeToRemove.URL().URL.Host == c.URL().Host && ok) {
 				return nil
 			}
 
@@ -149,6 +158,16 @@ func trustDelete(s state.State, r *http.Request) response.Response {
 		}
 	}
 
+	// If the entry doesn't exist locally, that's fine this is the desired state. This can happen when:
+	// 1. Entry was already removed.
+	// 2. Heartbeat hasn't propagated the entry to this node yet.
+	// 3. This is a cleanup operation after partial failure.
+	if !ok {
+		logger.Info("Truststore entry already absent, nothing to remove locally", slog.String("name", name))
+		return response.EmptySyncResponse
+	}
+
+	// Remove the entry from local truststore
 	remotes := s.Remotes()
 	remotesMap = remotes.RemotesByName()
 	delete(remotesMap, name)
